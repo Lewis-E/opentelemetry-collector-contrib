@@ -6,15 +6,20 @@
 package datadogexporter
 
 import (
+	"bytes"
+	"compress/zlib"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/DataDog/agent-payload/v5/gogen"
 	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/exporter/serializerexporter"
+	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
@@ -64,6 +69,54 @@ func singleGaugeMetrics() pmetric.Metrics {
 	dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	dp.SetDoubleValue(1.0)
 	return md
+}
+
+func azureAppServiceMetrics(instanceIDs ...string) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	for _, instanceID := range instanceIDs {
+		rm := md.ResourceMetrics().AppendEmpty()
+		attrs := rm.Resource().Attributes()
+		attrs.PutStr("cloud.platform", "azure.app_service")
+		attrs.PutStr("service.name", "my-app")
+		attrs.PutStr("cloud.account.id", "sub-123")
+		attrs.PutStr("azure.resource_group.name", "my-rg")
+		attrs.PutStr("azure.app_service.instance.id", instanceID)
+
+		metric := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+		metric.SetName("test.azure_app_service.gauge")
+		dp := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+		dp.SetDoubleValue(1)
+	}
+	return md
+}
+
+func azureAppServiceRunningMetricTags(t *testing.T, body []byte) [][]string {
+	t.Helper()
+
+	zr, err := zlib.NewReader(bytes.NewReader(body))
+	require.NoError(t, err)
+	defer zr.Close()
+	data, err := io.ReadAll(zr)
+	require.NoError(t, err)
+
+	payload := new(gogen.MetricPayload)
+	require.NoError(t, payload.Unmarshal(data))
+
+	var tagSets [][]string
+	for _, series := range payload.GetSeries() {
+		if series.GetMetric() != "otel.datadog_exporter.metrics.running.azureappservices" {
+			continue
+		}
+		assert.Equal(t, gogen.MetricPayload_GAUGE, series.GetType())
+		require.Len(t, series.GetResources(), 1)
+		assert.Equal(t, "host", series.GetResources()[0].GetType())
+		assert.Empty(t, series.GetResources()[0].GetName())
+		require.Len(t, series.GetPoints(), 1)
+		assert.Equal(t, 1.0, series.GetPoints()[0].GetValue())
+		tagSets = append(tagSets, series.GetTags())
+	}
+	return tagSets
 }
 
 // setSyncForwarderGate enables or disables the UseSyncForwarder gate and
@@ -131,6 +184,59 @@ func buildSyncForwarderExporter(t *testing.T, intakeURL string) exporter.Metrics
 	require.NoError(t, exp.Start(t.Context(), componenttest.NewNopHost()))
 	t.Cleanup(func() { _ = exp.Shutdown(t.Context()) })
 	return exp
+}
+
+func TestAzureAppServiceRunningMetrics(t *testing.T) {
+	tests := []struct {
+		name        string
+		instanceIDs []string
+	}{
+		{name: "complete identity", instanceIDs: []string{"instance-1"}},
+		{name: "distinct resources", instanceIDs: []string{"instance-1", "instance-2"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setSyncForwarderGate(t, true)
+
+			seriesRecorder := &testutil.HTTPRequestRecorderWithChan{
+				Pattern: testutil.MetricV2Endpoint,
+				ReqChan: make(chan []byte, 1),
+			}
+			server := testutil.DatadogServerMock(seriesRecorder.HandlerFunc)
+			defer server.Close()
+
+			exp := buildSyncForwarderExporter(t, server.URL)
+			require.NoError(t, exp.ConsumeMetrics(t.Context(), azureAppServiceMetrics(tt.instanceIDs...)))
+
+			var body []byte
+			select {
+			case body = <-seriesRecorder.ReqChan:
+			case <-time.After(10 * time.Second):
+				t.Fatal("timed out waiting for Datadog series payload")
+			}
+
+			got := azureAppServiceRunningMetricTags(t, body)
+			require.Len(t, got, len(tt.instanceIDs))
+
+			for _, instanceID := range tt.instanceIDs {
+				var matchingTags []string
+				for _, tags := range got {
+					if slices.Contains(tags, "instance:"+instanceID) {
+						matchingTags = tags
+						break
+					}
+				}
+				require.NotNil(t, matchingTags, "missing running metric for %s", instanceID)
+				assert.Subset(t, matchingTags, []string{
+					"instance:" + instanceID,
+					"name:my-app",
+					"resource_group:my-rg",
+					"subscription_id:sub-123",
+				})
+			}
+		})
+	}
 }
 
 // TestSyncForwarder_PropagatesErrors verifies that when
