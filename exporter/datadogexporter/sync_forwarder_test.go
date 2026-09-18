@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -91,7 +92,7 @@ func azureAppServiceMetrics(instanceIDs ...string) pmetric.Metrics {
 	return md
 }
 
-func azureAppServiceRunningMetricTags(t *testing.T, body []byte) [][]string {
+func runningMetricTags(t *testing.T, body []byte, metricName string) [][]string {
 	t.Helper()
 
 	zr, err := zlib.NewReader(bytes.NewReader(body))
@@ -105,7 +106,7 @@ func azureAppServiceRunningMetricTags(t *testing.T, body []byte) [][]string {
 
 	var tagSets [][]string
 	for _, series := range payload.GetSeries() {
-		if series.GetMetric() != "otel.datadog_exporter.metrics.running.azureappservices" {
+		if series.GetMetric() != metricName {
 			continue
 		}
 		assert.Equal(t, gogen.MetricPayload_GAUGE, series.GetType())
@@ -117,6 +118,53 @@ func azureAppServiceRunningMetricTags(t *testing.T, body []byte) [][]string {
 		tagSets = append(tagSets, series.GetTags())
 	}
 	return tagSets
+}
+
+type azureFunctionsResource struct {
+	appName       string
+	instanceID    string
+	functionName  string
+	resourceGroup string
+}
+
+func azureFunctionsMetrics(resources ...azureFunctionsResource) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	for _, resource := range resources {
+		rm := md.ResourceMetrics().AppendEmpty()
+		attrs := rm.Resource().Attributes()
+		attrs.PutStr("cloud.platform", "azure.functions")
+		attrs.PutStr("service.name", resource.appName)
+		attrs.PutStr("cloud.account.id", "sub-123")
+		if resource.resourceGroup != "" {
+			attrs.PutStr("azure.resource_group.name", resource.resourceGroup)
+		}
+		attrs.PutStr("faas.instance", resource.instanceID)
+		attrs.PutStr("faas.name", resource.functionName)
+
+		metric := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+		metric.SetName("azure.functions.requests")
+		dp := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+		dp.SetDoubleValue(1)
+	}
+	return md
+}
+
+func azureFunctionsIdentityTags(tagSets [][]string) [][]string {
+	identityTagSets := make([][]string, 0, len(tagSets))
+	for _, tagSet := range tagSets {
+		identityTags := make([]string, 0, 4)
+		for _, tag := range tagSet {
+			if strings.HasPrefix(tag, "instance:") ||
+				strings.HasPrefix(tag, "name:") ||
+				strings.HasPrefix(tag, "resource_group:") ||
+				strings.HasPrefix(tag, "subscription_id:") {
+				identityTags = append(identityTags, tag)
+			}
+		}
+		identityTagSets = append(identityTagSets, identityTags)
+	}
+	return identityTagSets
 }
 
 // setSyncForwarderGate enables or disables the UseSyncForwarder gate and
@@ -216,7 +264,7 @@ func TestAzureAppServiceRunningMetrics(t *testing.T) {
 				t.Fatal("timed out waiting for Datadog series payload")
 			}
 
-			got := azureAppServiceRunningMetricTags(t, body)
+			got := runningMetricTags(t, body, "otel.datadog_exporter.metrics.running.azureappservices")
 			require.Len(t, got, len(tt.instanceIDs))
 
 			for _, instanceID := range tt.instanceIDs {
@@ -235,6 +283,95 @@ func TestAzureAppServiceRunningMetrics(t *testing.T) {
 					"subscription_id:sub-123",
 				})
 			}
+		})
+	}
+}
+
+func TestAzureFunctionsRunningMetrics(t *testing.T) {
+	tests := []struct {
+		name      string
+		resources []azureFunctionsResource
+		wantTags  [][]string
+	}{
+		{
+			name: "complete canonical identity",
+			resources: []azureFunctionsResource{
+				{appName: "my-app", instanceID: "instance-1", functionName: "function-a", resourceGroup: "my-rg"},
+			},
+			wantTags: [][]string{{
+				"instance:instance-1",
+				"name:my-app",
+				"resource_group:my-rg",
+				"subscription_id:sub-123",
+			}},
+		},
+		{
+			name: "two functions in one app instance",
+			resources: []azureFunctionsResource{
+				{appName: "my-app", instanceID: "instance-1", functionName: "function-a", resourceGroup: "my-rg"},
+				{appName: "my-app", instanceID: "instance-1", functionName: "function-b", resourceGroup: "my-rg"},
+			},
+			wantTags: [][]string{{
+				"instance:instance-1",
+				"name:my-app",
+				"resource_group:my-rg",
+				"subscription_id:sub-123",
+			}},
+		},
+		{
+			name: "two app instances",
+			resources: []azureFunctionsResource{
+				{appName: "my-app", instanceID: "instance-1", functionName: "function-a", resourceGroup: "my-rg"},
+				{appName: "my-app", instanceID: "instance-2", functionName: "function-a", resourceGroup: "my-rg"},
+			},
+			wantTags: [][]string{
+				{"instance:instance-1", "name:my-app", "resource_group:my-rg", "subscription_id:sub-123"},
+				{"instance:instance-2", "name:my-app", "resource_group:my-rg", "subscription_id:sub-123"},
+			},
+		},
+		{
+			name: "different apps with shared instance string",
+			resources: []azureFunctionsResource{
+				{appName: "first-app", instanceID: "shared-instance", functionName: "function-a", resourceGroup: "my-rg"},
+				{appName: "second-app", instanceID: "shared-instance", functionName: "function-a", resourceGroup: "my-rg"},
+			},
+			wantTags: [][]string{
+				{"instance:shared-instance", "name:first-app", "resource_group:my-rg", "subscription_id:sub-123"},
+				{"instance:shared-instance", "name:second-app", "resource_group:my-rg", "subscription_id:sub-123"},
+			},
+		},
+		{
+			name: "incomplete identity",
+			resources: []azureFunctionsResource{
+				{appName: "my-app", instanceID: "instance-1", functionName: "function-a"},
+			},
+			wantTags: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setSyncForwarderGate(t, true)
+
+			seriesRecorder := &testutil.HTTPRequestRecorderWithChan{
+				Pattern: testutil.MetricV2Endpoint,
+				ReqChan: make(chan []byte, 1),
+			}
+			server := testutil.DatadogServerMock(seriesRecorder.HandlerFunc)
+			defer server.Close()
+
+			exp := buildSyncForwarderExporter(t, server.URL)
+			require.NoError(t, exp.ConsumeMetrics(t.Context(), azureFunctionsMetrics(tt.resources...)))
+
+			var body []byte
+			select {
+			case body = <-seriesRecorder.ReqChan:
+			case <-time.After(10 * time.Second):
+				t.Fatal("timed out waiting for Datadog series payload")
+			}
+
+			got := runningMetricTags(t, body, "otel.datadog_exporter.metrics.running.azurefunctions")
+			assert.ElementsMatch(t, tt.wantTags, azureFunctionsIdentityTags(got))
 		})
 	}
 }
